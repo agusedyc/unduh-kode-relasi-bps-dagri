@@ -3,11 +3,11 @@ import csv
 import requests
 import time
 import undetected_chromedriver as uc
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # BPS menggunakan perlindungan Cloudflare Turnstile tingkat tinggi.
 # Playwright biasa terdeteksi. Kita gunakan undetected_chromedriver.
-
-import os
 
 periode = '2025_2.2025'
 domain = 'https://sig.bps.go.id'
@@ -72,45 +72,70 @@ headers = {
 prov = [p['kode_bps'] for p in dhtml_prov]
 print(f"Provinsi ditemukan: {len(prov)}")
 
-desa = []
-for i in prov:
-    url_kab = f"{domain}/rest-bridging/getwilayah?level=kabupaten&parent={i}&periode_merge={periode}"
-    res = requests.get(url_kab, headers=headers)
+def proses_provinsi(kode_prov, headers, periode, domain):
+    desa_lokal = []
+    url_kab = f"{domain}/rest-bridging/getwilayah?level=kabupaten&parent={kode_prov}&periode_merge={periode}"
     
-    if "One moment, please" in res.text:
-        print("\n[ERROR] Sesi terputus/ditolak Cloudflare di tengah jalan.")
-        break
-        
     try:
+        res = requests.get(url_kab, headers=headers, timeout=30)
+        if "One moment, please" in res.text:
+            print(f"\n[ERROR] Sesi terputus/ditolak Cloudflare di Provinsi {kode_prov}")
+            return []
         dhtml = res.json()
-    except json.JSONDecodeError:
-        print("\nGagal baca JSON. Respons BPS:", res.text[:100])
-        break
+    except Exception as e:
+        print(f"\nGagal baca Kab/Kot Provinsi {kode_prov}: {e}")
+        return []
 
     for j in dhtml:
         url_kec = f"{domain}/rest-bridging/getwilayah?level=kecamatan&parent={j['kode_bps']}&periode_merge={periode}"
-        res2 = requests.get(url_kec, headers=headers)
-        dhtml2 = res2.json()
-        
+        try:
+            res2 = requests.get(url_kec, headers=headers, timeout=30)
+            dhtml2 = res2.json()
+        except Exception:
+            continue
+            
+        # Rename keys j
         for key in list(j.keys()):
             j[key+'_kabkot'] = j.pop(key)
             
         for n in dhtml2:
-            print(f"Memproses : {j.get('nama_bps_kabkot', '')}")
+            print(f"Memproses : {j.get('nama_bps_kabkot', '')} - Kec: {n.get('nama_bps', '')}")
             url_desa = f"{domain}/rest-bridging/getwilayah?level=desa&parent={n['kode_bps']}&periode_merge={periode}"
-            res3 = requests.get(url_desa, headers=headers)
-            dhtml3 = res3.json()
-            
+            try:
+                res3 = requests.get(url_desa, headers=headers, timeout=30)
+                dhtml3 = res3.json()
+            except Exception:
+                continue
+                
+            # Rename keys n
             for key in list(n.keys()):
                 n[key+'_kec'] = n.pop(key)
+            
+            # Merge kabkot dict ke kec dict
             n.update(j)
             
             for k in dhtml3:
+                # Rename keys k
                 for key in list(k.keys()):
                     k[key+'_deskel'] = k.pop(key)
+                
+                # Merge kec dict (n) ke deskel dict (k)
                 k.update(n)
-                desa.append(k)
-                print(f"Selesai: {j.get('nama_bps_kabkot', '')} | Kec: {n.get('nama_bps_kec', '')} | Desa: {k.get('nama_bps_deskel', '')}")
+                desa_lokal.append(k.copy())
+                
+    print(f"--- Selesai Provinsi {kode_prov}: {len(desa_lokal)} desa diproses ---")
+    return desa_lokal
+
+desa = []
+print("\nMemulai proses unduh secara paralel (10 Provinsi bersamaan)...")
+# Gunakan 10 thread (max_workers=10)
+with ThreadPoolExecutor(max_workers=10) as executor:
+    futures = [executor.submit(proses_provinsi, p, headers, periode, domain) for p in prov]
+    
+    for future in as_completed(futures):
+        hasil = future.result()
+        if hasil:
+            desa.extend(hasil)
 
 if len(desa) > 0:
     head = list(desa[0].keys())
@@ -118,6 +143,6 @@ if len(desa) > 0:
         d_w = csv.DictWriter(o_f, head)
         d_w.writeheader()
         d_w.writerows(desa)
-    print("Selesai. Data disimpan.")
+    print(f"\nSelesai. Total {len(desa)} Data disimpan ke data-relasi-baru.csv")
 else:
-    print('Tidak ada data desa yang diproses.')
+    print('\nTidak ada data desa yang diproses.')
